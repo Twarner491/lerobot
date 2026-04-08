@@ -13,6 +13,14 @@ Full project documentation can be found on: [https://teddywarner.org/Projects/pi
 > but must acknowledge Teddy Warner. Copyright is retained and must be preserved. 
 > The work is provided as is; no warranty is provided, and users accept all liability.
 
+sudo modprobe v4l2loopback && lsmod | grep v4l2loopback
+
+ls -la /dev/video*
+
+flatpak run com.obsproject.Studio
+
+conda activate lerobot
+
 ## Citations
 
 ```bibtex

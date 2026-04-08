@@ -477,13 +477,13 @@ class So100RobotConfig(ManipulatorRobotConfig):
     cameras: dict[str, CameraConfig] = field(
         default_factory=lambda: {
             "phone": OpenCVCameraConfig(
-                camera_index=0,
+                camera_index="/dev/video4",  # Phone camera (loopback device)
                 fps=30,
                 width=640,
                 height=480,
             ),
             "gripper": OpenCVCameraConfig(
-                camera_index=1,
+                camera_index="/dev/video0",  # Arducam USB Camera (gripper)
                 fps=30,
                 width=640,
                 height=480,

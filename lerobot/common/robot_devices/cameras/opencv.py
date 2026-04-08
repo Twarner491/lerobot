@@ -304,12 +304,27 @@ class OpenCVCamera:
             else cv2.CAP_ANY
         )
 
-        camera_idx = f"/dev/video{self.camera_index}" if platform.system() == "Linux" else self.camera_index
+        camera_idx = f"/dev/video{self.camera_index}" if platform.system() == "Linux" and isinstance(self.camera_index, int) else self.camera_index
+        
+        # Critical: For ArduCam camera (video0), force MJPG format
+        is_arducam = isinstance(self.camera_index, str) and "video0" in self.camera_index
+        
+        # For ArduCam, set format before opening
+        if is_arducam and platform.system() == "Linux":
+            try:
+                # Set the camera format to MJPG using v4l2-ctl (more reliable than OpenCV properties)
+                import subprocess
+                subprocess.run(["v4l2-ctl", "-d", "/dev/video0", "--set-fmt-video=width=640,height=480,pixelformat=MJPG"], 
+                           check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                print("Set ArduCam format to MJPG using v4l2-ctl")
+            except Exception as e:
+                print(f"Warning: Could not set format with v4l2-ctl: {e}")
+
         # First create a temporary camera trying to access `camera_index`,
         # and verify it is a valid camera by calling `isOpened`.
         tmp_camera = cv2.VideoCapture(camera_idx, backend)
         is_camera_open = tmp_camera.isOpened()
-        # Release camera to make it accessible for `find_camera_indices`
+        # Release camera to make it accessible
         tmp_camera.release()
         del tmp_camera
 
@@ -328,9 +343,14 @@ class OpenCVCamera:
             raise OSError(f"Can't access OpenCVCamera({camera_idx}).")
 
         # Secondly, create the camera that will be used downstream.
-        # Note: For some unknown reason, calling `isOpened` blocks the camera which then
-        # needs to be re-created.
         self.camera = cv2.VideoCapture(camera_idx, backend)
+        
+        # For ArduCam, must set MJPG format BEFORE setting resolution and fps
+        if is_arducam:
+            # Force MJPG format for ArduCam (essential for it to work properly)
+            fourcc = cv2.VideoWriter_fourcc('M', 'J', 'P', 'G')
+            self.camera.set(cv2.CAP_PROP_FOURCC, fourcc)
+            print(f"Setting ArduCam camera format to MJPG")
 
         if self.fps is not None:
             self.camera.set(cv2.CAP_PROP_FPS, self.fps)
@@ -338,34 +358,138 @@ class OpenCVCamera:
             self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.capture_width)
         if self.capture_height is not None:
             self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.capture_height)
+            
+        # Additional camera settings for Arducam USB camera
+        if is_arducam:
+            print(f"Applying ArduCam-specific settings for {self.camera_index}")
+            try:
+                # Buffer size must be minimal to prevent lag
+                self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                
+                # Set specific camera parameters from testMS.py
+                self.camera.set(cv2.CAP_PROP_BRIGHTNESS, 0)     # Default 0, range -64 to 64
+                self.camera.set(cv2.CAP_PROP_CONTRAST, 32)      # Default 32, range 0 to 64
+                self.camera.set(cv2.CAP_PROP_SATURATION, 64)    # Default 64, range 0 to 128
+                self.camera.set(cv2.CAP_PROP_GAIN, 0)           # Default 0, range 0 to 100
+                
+                # Test read with a short timeout
+                import signal
+                
+                def timeout_handler(signum, frame):
+                    raise TimeoutError("Camera read timed out")
+                
+                # Set timeout for 0.5 seconds
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(1)
+                
+                try:
+                    ret, _ = self.camera.read()
+                    signal.alarm(0)  # Cancel alarm
+                    if not ret:
+                        print(f"Warning: Initial frame read failed for {camera_idx}")
+                except TimeoutError:
+                    signal.alarm(0)  # Cancel alarm
+                    print(f"Warning: Initial frame read timed out for {camera_idx}")
+                    # Recreate the camera - sometimes this helps
+                    self.camera.release()
+                    self.camera = cv2.VideoCapture(camera_idx, backend)
+                    self.camera.set(cv2.CAP_PROP_FOURCC, fourcc)
+                    if self.fps is not None:
+                        self.camera.set(cv2.CAP_PROP_FPS, self.fps)
+                    if self.capture_width is not None:
+                        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.capture_width)
+                    if self.capture_height is not None:
+                        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.capture_height)
+            except Exception as e:
+                print(f"Warning: Could not apply ArduCam settings: {e}")
 
         actual_fps = self.camera.get(cv2.CAP_PROP_FPS)
         actual_width = self.camera.get(cv2.CAP_PROP_FRAME_WIDTH)
         actual_height = self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        
+        # Get the actual format
+        try:
+            fourcc_int = int(self.camera.get(cv2.CAP_PROP_FOURCC))
+            fourcc_str = "".join([chr((fourcc_int >> 8 * i) & 0xFF) for i in range(4)])
+            
+            # If this is ArduCam and not using MJPG, try to force it again
+            if is_arducam and fourcc_str != "MJPG":
+                print(f"Warning: ArduCam not using MJPG format (got {fourcc_str}). Attempting to force MJPG...")
+                self.camera.release()
+                
+                # Try with direct format setting again
+                import subprocess
+                subprocess.run(["v4l2-ctl", "-d", "/dev/video0", "--set-fmt-video=width=640,height=480,pixelformat=MJPG"], 
+                           check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                
+                self.camera = cv2.VideoCapture(camera_idx, backend)
+                fourcc = cv2.VideoWriter_fourcc('M', 'J', 'P', 'G')
+                self.camera.set(cv2.CAP_PROP_FOURCC, fourcc)
+                
+                # Set other properties again
+                if self.fps is not None:
+                    self.camera.set(cv2.CAP_PROP_FPS, self.fps)
+                if self.capture_width is not None:
+                    self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.capture_width)
+                if self.capture_height is not None:
+                    self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.capture_height)
+                
+                # Get the format again to check
+                fourcc_int = int(self.camera.get(cv2.CAP_PROP_FOURCC))
+                fourcc_str = "".join([chr((fourcc_int >> 8 * i) & 0xFF) for i in range(4)])
+        except Exception as e:
+            print(f"Error getting camera format: {e}")
+            fourcc_str = "Unknown"
 
         # Using `math.isclose` since actual fps can be a float (e.g. 29.9 instead of 30)
         if self.fps is not None and not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
-            # Using `OSError` since it's a broad that encompasses issues related to device communication
-            raise OSError(
-                f"Can't set {self.fps=} for OpenCVCamera({self.camera_index}). Actual value is {actual_fps}."
-            )
+            # For ArduCam, we'll be more lenient about FPS requirements
+            if not is_arducam:
+                raise OSError(
+                    f"Can't set {self.fps=} for OpenCVCamera({self.camera_index}). Actual value is {actual_fps}."
+                )
+            else:
+                print(f"Warning: ArduCam FPS set to {self.fps} but actual is {actual_fps}. Continuing anyway.")
+                
         if self.capture_width is not None and not math.isclose(
             self.capture_width, actual_width, rel_tol=1e-3
         ):
-            raise OSError(
-                f"Can't set {self.capture_width=} for OpenCVCamera({self.camera_index}). Actual value is {actual_width}."
-            )
+            if not is_arducam:
+                raise OSError(
+                    f"Can't set {self.capture_width=} for OpenCVCamera({self.camera_index}). Actual value is {actual_width}."
+                )
+            else:
+                print(f"Warning: ArduCam width set to {self.capture_width} but actual is {actual_width}. Continuing anyway.")
+                
         if self.capture_height is not None and not math.isclose(
             self.capture_height, actual_height, rel_tol=1e-3
         ):
-            raise OSError(
-                f"Can't set {self.capture_height=} for OpenCVCamera({self.camera_index}). Actual value is {actual_height}."
-            )
+            if not is_arducam:
+                raise OSError(
+                    f"Can't set {self.capture_height=} for OpenCVCamera({self.camera_index}). Actual value is {actual_height}."
+                )
+            else:
+                print(f"Warning: ArduCam height set to {self.capture_height} but actual is {actual_height}. Continuing anyway.")
 
-        self.fps = round(actual_fps)
+        self.fps = round(actual_fps) if actual_fps > 0 else 30
         self.capture_width = round(actual_width)
         self.capture_height = round(actual_height)
         self.is_connected = True
+        
+        # Print device info for debugging
+        print(f"Camera {self.camera_index} ready:")
+        print(f"  Resolution: {self.capture_width}x{self.capture_height}")
+        print(f"  FPS: {self.fps}")
+        print(f"  Format: {fourcc_str}")
+
+        # For ArduCam, perform a test read to ensure it's working
+        if is_arducam:
+            # Read a few frames to "warm up" the camera
+            for _ in range(3):
+                ret, _ = self.camera.read()
+                if ret:
+                    print("ArduCam successfully delivered a test frame")
+                    break
 
     def read(self, temporary_color_mode: str | None = None) -> np.ndarray:
         """Read a frame from the camera returned in the format (height, width, channels)
@@ -380,11 +504,64 @@ class OpenCVCamera:
             )
 
         start_time = time.perf_counter()
+        
+        # Check if this is the ArduCam camera
+        is_arducam = isinstance(self.camera_index, str) and "video0" in self.camera_index
 
-        ret, color_image = self.camera.read()
-
+        # Add retry logic for Arducam camera which may occasionally fail
+        max_retries = 5 if is_arducam else 1
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            ret, color_image = self.camera.read()
+            
+            if ret:
+                break
+                
+            # If we got a bad frame, retry for Arducam camera
+            if is_arducam:
+                print(f"Retrying read for ArduCam camera ({retry_count+1}/{max_retries})")
+                time.sleep(0.05)  # Short pause before retrying
+                retry_count += 1
+            else:
+                # For non-Arducam cameras, don't retry
+                break
+        
         if not ret:
+            # For the Arducam camera, return the last successful image if available
+            # rather than crashing the program
+            if is_arducam and self.color_image is not None:
+                print(f"Warning: Using last good frame for ArduCam camera")
+                return self.color_image
+            
             raise OSError(f"Can't capture color image from camera {self.camera_index}.")
+
+        # Import cv2 here to avoid circular import issues
+        if self.mock:
+            import tests.cameras.mock_cv2 as cv2
+        else:
+            import cv2
+            
+        # Enhance ArduCam images if they are too dark (like in testMS.py)
+        if is_arducam:
+            # Check brightness
+            gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+            brightness = np.mean(gray)
+            
+            # If image is too dark, enhance it
+            if brightness < 70:
+                # Increase brightness
+                alpha = 1.75  # Contrast control
+                beta = 40     # Brightness control
+                color_image = cv2.convertScaleAbs(color_image, alpha=alpha, beta=beta)
+                
+                # Apply CLAHE for better contrast in dark areas
+                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+                lab = cv2.cvtColor(color_image, cv2.COLOR_BGR2LAB)
+                l, a, b = cv2.split(lab)
+                l = clahe.apply(l)
+                lab = cv2.merge((l, a, b))
+                color_image = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
         requested_color_mode = self.color_mode if temporary_color_mode is None else temporary_color_mode
 
@@ -397,18 +574,18 @@ class OpenCVCamera:
         # However, Deep Learning framework such as LeRobot uses RGB format as default to train neural networks,
         # so we convert the image color from BGR to RGB.
         if requested_color_mode == "rgb":
-            if self.mock:
-                import tests.cameras.mock_cv2 as cv2
-            else:
-                import cv2
-
             color_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
 
         h, w, _ = color_image.shape
         if h != self.capture_height or w != self.capture_width:
-            raise OSError(
-                f"Can't capture color image with expected height and width ({self.height} x {self.width}). ({h} x {w}) returned instead."
-            )
+            if is_arducam:
+                # For ArduCam, resize the image rather than failing
+                print(f"Warning: ArduCam image size {w}x{h} doesn't match expected {self.capture_width}x{self.capture_height}. Resizing...")
+                color_image = cv2.resize(color_image, (self.capture_width, self.capture_height))
+            else:
+                raise OSError(
+                    f"Can't capture color image with expected height and width ({self.capture_height} x {self.capture_width}). ({h} x {w}) returned instead."
+                )
 
         if self.rotation is not None:
             color_image = cv2.rotate(color_image, self.rotation)
@@ -424,11 +601,37 @@ class OpenCVCamera:
         return color_image
 
     def read_loop(self):
+        """Background thread that continuously reads frames from the camera"""
+        # Check if this is the ArduCam camera
+        is_arducam = isinstance(self.camera_index, str) and "video0" in self.camera_index
+        
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+        
         while not self.stop_event.is_set():
             try:
                 self.color_image = self.read()
+                consecutive_errors = 0  # Reset error counter on success
+                # Short sleep to prevent CPU hogging
+                time.sleep(0.01)
             except Exception as e:
-                print(f"Error reading in thread: {e}")
+                consecutive_errors += 1
+                if consecutive_errors > max_consecutive_errors and is_arducam:
+                    # For ArduCam, if we get too many errors, create a fallback image
+                    print(f"Too many consecutive errors with ArduCam camera: {e}")
+                    # Import here to avoid circular imports
+                    import cv2
+                    placeholder = np.zeros((self.capture_height, self.capture_width, 3), dtype=np.uint8)
+                    cv2.putText(placeholder, "ArduCam Error", 
+                               (self.capture_width//4, self.capture_height//2),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                    if self.color_mode == "rgb":
+                        placeholder = cv2.cvtColor(placeholder, cv2.COLOR_BGR2RGB)
+                    self.color_image = placeholder
+                else:
+                    print(f"Error reading in thread: {e}")
+                # Longer sleep on error to avoid rapid error loops
+                time.sleep(0.1)
 
     def async_read(self):
         if not self.is_connected:
@@ -436,21 +639,79 @@ class OpenCVCamera:
                 f"OpenCVCamera({self.camera_index}) is not connected. Try running `camera.connect()` first."
             )
 
+        # Check if this is the ArduCam camera
+        is_arducam = isinstance(self.camera_index, str) and "video0" in self.camera_index
+        
+        # Start the camera read thread if not already running
         if self.thread is None:
             self.stop_event = threading.Event()
             self.thread = Thread(target=self.read_loop, args=())
             self.thread.daemon = True
             self.thread.start()
 
+        # Set appropriate timeout parameters for different cameras
+        if is_arducam:
+            # ArduCam needs more time and more leniency
+            max_tries = self.fps * 5  # Allow more time - up to 5 seconds
+            sleep_time = 1.0 / self.fps
+        else:
+            # Standard camera parameters
+            max_tries = self.fps * 2  # Up to 2 seconds
+            sleep_time = 1.0 / self.fps
+            
         num_tries = 0
         while True:
             if self.color_image is not None:
                 return self.color_image
 
-            time.sleep(1 / self.fps)
+            time.sleep(sleep_time)
             num_tries += 1
-            if num_tries > self.fps * 2:
-                raise TimeoutError("Timed out waiting for async_read() to start.")
+            
+            # For ArduCam camera, allow more attempts and return a placeholder if needed
+            if is_arducam:
+                if num_tries > max_tries:
+                    print(f"Warning: No frames received from ArduCam camera after {num_tries} attempts")
+                    
+                    if self.mock:
+                        import tests.cameras.mock_cv2 as cv2
+                    else:
+                        import cv2
+                    
+                    # Create a placeholder image rather than failing
+                    placeholder = np.zeros((self.capture_height, self.capture_width, 3), dtype=np.uint8)
+                    
+                    # Add red background
+                    cv2.rectangle(placeholder, (0, 0), (self.capture_width, self.capture_height), 
+                                 (0, 0, 60) if self.color_mode == "rgb" else (60, 0, 0), -1)
+                    
+                    # Add explanatory text
+                    text_color = (0, 200, 255) if self.color_mode == "rgb" else (255, 200, 0)
+                    messages = [
+                        "ARDUCAM NOT RESPONDING",
+                        "USB Camera unavailable",
+                        "Check connections and restart"
+                    ]
+                    
+                    y_pos = self.capture_height // 4
+                    for msg in messages:
+                        cv2.putText(
+                            placeholder,
+                            msg,
+                            (self.capture_width // 10, y_pos),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            text_color,
+                            2
+                        )
+                        y_pos += 40
+                        
+                    # Convert to RGB if needed
+                    if self.color_mode == "rgb":
+                        placeholder = cv2.cvtColor(placeholder, cv2.COLOR_BGR2RGB)
+                        
+                    return placeholder
+            elif num_tries > max_tries:
+                raise TimeoutError(f"Timed out waiting for async_read() to start for camera {self.camera_index}.")
 
     def disconnect(self):
         if not self.is_connected:
